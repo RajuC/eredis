@@ -65,6 +65,39 @@ start_link(Host, Port, Database, Password, ReconnectSleep, ConnectTimeout) ->
 stop(Pid) ->
     gen_server:call(Pid, stop).
 
+
+
+
+
+
+
+
+
+-define(DEFAULT_CIPHERS,
+  ["ECDHE-ECDSA-AES256-GCM-SHA384","ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384","ECDHE-RSA-AES256-SHA384", "ECDHE-ECDSA-DES-CBC3-SHA",
+    "ECDH-ECDSA-AES256-GCM-SHA384","ECDH-RSA-AES256-GCM-SHA384","ECDH-ECDSA-AES256-SHA384",
+    "ECDH-RSA-AES256-SHA384","DHE-DSS-AES256-GCM-SHA384","DHE-DSS-AES256-SHA256",
+    "AES256-GCM-SHA384","AES256-SHA256","ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256","ECDHE-ECDSA-AES128-SHA256","ECDHE-RSA-AES128-SHA256",
+    "ECDH-ECDSA-AES128-GCM-SHA256","ECDH-RSA-AES128-GCM-SHA256","ECDH-ECDSA-AES128-SHA256",
+    "ECDH-RSA-AES128-SHA256","DHE-DSS-AES128-GCM-SHA256","DHE-DSS-AES128-SHA256",
+    "AES128-GCM-SHA256","AES128-SHA256","ECDHE-ECDSA-AES256-SHA",
+    "ECDHE-RSA-AES256-SHA","DHE-DSS-AES256-SHA","ECDH-ECDSA-AES256-SHA",
+    "ECDH-RSA-AES256-SHA","AES256-SHA","ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA","DHE-DSS-AES128-SHA","ECDH-ECDSA-AES128-SHA",
+    "ECDH-RSA-AES128-SHA","AES128-SHA"]).
+
+-define(WITHOUT_ECC_CIPHERS,
+  ["DHE-DSS-AES256-GCM-SHA384","DHE-DSS-AES256-SHA256",
+    "AES256-GCM-SHA384","AES256-SHA256", "DHE-DSS-AES128-GCM-SHA256","DHE-DSS-AES128-SHA256",
+    "AES128-GCM-SHA256","AES128-SHA256", "DHE-DSS-AES256-SHA", "AES256-SHA",
+    "DHE-DSS-AES128-SHA", "AES128-SHA"]).
+
+
+
+
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -127,7 +160,7 @@ handle_cast(_Msg, State) ->
 %% Receive data from socket, see handle_response/2. Match `Socket' to
 %% enforce sanity.
 handle_info({tcp, Socket, Bs}, #state{socket = Socket} = State) ->
-    ok = inet:setopts(Socket, [{active, once}]),
+    ok = ssl:setopts(Socket, [{active, once}]),
     {noreply, handle_response(Bs, State)};
 
 handle_info({tcp, Socket, _}, #state{socket = OurSocket} = State)
@@ -174,7 +207,7 @@ handle_info(_Info, State) ->
 terminate(_Reason, State) ->
     case State#state.socket of
         undefined -> ok;
-        Socket    -> gen_tcp:close(Socket)
+        Socket    -> ssl:close(Socket)
     end,
     ok.
 
@@ -193,7 +226,7 @@ do_request(_Req, _From, #state{socket = undefined} = State) ->
     {reply, {error, no_connection}, State};
 
 do_request(Req, From, State) ->
-    case gen_tcp:send(State#state.socket, Req) of
+    case ssl:send(State#state.socket, Req) of
         ok ->
             NewQueue = queue:in({1, From}, State#state.queue),
             {noreply, State#state{queue = NewQueue}};
@@ -209,7 +242,7 @@ do_pipeline(_Pipeline, _From, #state{socket = undefined} = State) ->
     {reply, {error, no_connection}, State};
 
 do_pipeline(Pipeline, From, State) ->
-    case gen_tcp:send(State#state.socket, Pipeline) of
+    case ssl:send(State#state.socket, Pipeline) of
         ok ->
             NewQueue = queue:in({length(Pipeline), From, []}, State#state.queue),
             {noreply, State#state{queue = NewQueue}};
@@ -296,22 +329,44 @@ safe_send(Pid, Value) ->
             error_logger:info_msg("eredis: Failed to send message to ~p with reason ~p~n", [Pid, {Err, Reason}])
     end.
 
+
+ciphers() ->
+  case lists:keymember(ecdh_rsa, 1, ssl:cipher_suites()) of
+    true -> ?DEFAULT_CIPHERS;
+    false ->
+      error_logger:warning_msg("hackney_ssl: ECC not enabled"),
+      ?WITHOUT_ECC_CIPHERS
+  end.
+
+
 %% @doc: Helper for connecting to Redis, authenticating and selecting
 %% the correct database. These commands are synchronous and if Redis
 %% returns something we don't expect, we crash. Returns {ok, State} or
 %% {SomeError, Reason}.
 connect(State) ->
+    io:format("~n===================State: ~p~n", [State]),
     {ok, {AFamily, Addr}} = get_addr(State#state.host),
     Port = case AFamily of
         local -> 0;
         _ -> State#state.port
     end,
-    case gen_tcp:connect(Addr, Port,
-                         [AFamily | ?SOCKET_OPTS], State#state.connect_timeout) of
+
+
+  BaseOpts = [binary, {active, false}, {packet, raw},
+    {secure_renegotiate, true},
+    {reuse_sessions, true},
+    {honor_cipher_order, true},
+    {versions,['tlsv1.2', 'tlsv1.1', tlsv1, sslv3]},
+    {ciphers, ciphers()}],
+  % Opts1 = merge_opts(BaseOpts, Opts),
+
+    io:format("~n===================AFamily: ~p~n", [AFamily]),
+    case ssl:connect(Addr, Port,
+                         [AFamily | BaseOpts], State#state.connect_timeout) of
         {ok, Socket} ->
-            case authenticate(Socket, State#state.password) of
+            case authenticate(Socket, binary_to_list(State#state.password)) of
                 ok ->
-                    case select_database(Socket, State#state.database) of
+                    case select_database(Socket, binary_to_list(State#state.database)) of
                         ok ->
                             {ok, State#state{socket = Socket}};
                         {error, Reason} ->
@@ -356,13 +411,13 @@ authenticate(Socket, Password) ->
 %% @doc: Executes the given command synchronously, expects Redis to
 %% return "+OK\r\n", otherwise it will fail.
 do_sync_command(Socket, Command) ->
-    ok = inet:setopts(Socket, [{active, false}]),
-    case gen_tcp:send(Socket, Command) of
+    ok = ssl:setopts(Socket, [{active, false}]),
+    case ssl:send(Socket, Command) of
         ok ->
             %% Hope there's nothing else coming down on the socket..
-            case gen_tcp:recv(Socket, 0, ?RECV_TIMEOUT) of
+            case ssl:recv(Socket, 0, ?RECV_TIMEOUT) of
                 {ok, <<"+OK\r\n">>} ->
-                    ok = inet:setopts(Socket, [{active, once}]),
+                    ok = ssl:setopts(Socket, [{active, once}]),
                     ok;
                 Other ->
                     {error, {unexpected_data, Other}}
@@ -397,7 +452,7 @@ reconnect_loop(Client, #state{reconnect_sleep = ReconnectSleep} = State) ->
     case catch(connect(State)) of
         {ok, #state{socket = Socket}} ->
             Client ! {connection_ready, Socket},
-            gen_tcp:controlling_process(Socket, Client),
+            ssl:controlling_process(Socket, Client),
             Msgs = get_all_messages([]),
             [Client ! M || M <- Msgs];
         {error, _Reason} ->
