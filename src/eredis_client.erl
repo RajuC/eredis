@@ -68,36 +68,6 @@ stop(Pid) ->
 
 
 
-
-
-
-
-
--define(DEFAULT_CIPHERS,
-  ["ECDHE-ECDSA-AES256-GCM-SHA384","ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES256-SHA384","ECDHE-RSA-AES256-SHA384", "ECDHE-ECDSA-DES-CBC3-SHA",
-    "ECDH-ECDSA-AES256-GCM-SHA384","ECDH-RSA-AES256-GCM-SHA384","ECDH-ECDSA-AES256-SHA384",
-    "ECDH-RSA-AES256-SHA384","DHE-DSS-AES256-GCM-SHA384","DHE-DSS-AES256-SHA256",
-    "AES256-GCM-SHA384","AES256-SHA256","ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-AES128-GCM-SHA256","ECDHE-ECDSA-AES128-SHA256","ECDHE-RSA-AES128-SHA256",
-    "ECDH-ECDSA-AES128-GCM-SHA256","ECDH-RSA-AES128-GCM-SHA256","ECDH-ECDSA-AES128-SHA256",
-    "ECDH-RSA-AES128-SHA256","DHE-DSS-AES128-GCM-SHA256","DHE-DSS-AES128-SHA256",
-    "AES128-GCM-SHA256","AES128-SHA256","ECDHE-ECDSA-AES256-SHA",
-    "ECDHE-RSA-AES256-SHA","DHE-DSS-AES256-SHA","ECDH-ECDSA-AES256-SHA",
-    "ECDH-RSA-AES256-SHA","AES256-SHA","ECDHE-ECDSA-AES128-SHA",
-    "ECDHE-RSA-AES128-SHA","DHE-DSS-AES128-SHA","ECDH-ECDSA-AES128-SHA",
-    "ECDH-RSA-AES128-SHA","AES128-SHA"]).
-
--define(WITHOUT_ECC_CIPHERS,
-  ["DHE-DSS-AES256-GCM-SHA384","DHE-DSS-AES256-SHA256",
-    "AES256-GCM-SHA384","AES256-SHA256", "DHE-DSS-AES128-GCM-SHA256","DHE-DSS-AES128-SHA256",
-    "AES128-GCM-SHA256","AES128-SHA256", "DHE-DSS-AES256-SHA", "AES256-SHA",
-    "DHE-DSS-AES128-SHA", "AES128-SHA"]).
-
-
-
-
-
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -159,15 +129,15 @@ handle_cast(_Msg, State) ->
 
 %% Receive data from socket, see handle_response/2. Match `Socket' to
 %% enforce sanity.
-handle_info({tcp, Socket, Bs}, #state{socket = Socket} = State) ->
+handle_info({ssl, Socket, Bs}, #state{socket = Socket} = State) ->
     ok = ssl:setopts(Socket, [{active, once}]),
     {noreply, handle_response(Bs, State)};
 
-handle_info({tcp, Socket, _}, #state{socket = OurSocket} = State)
+handle_info({ssl, Socket, _}, #state{socket = OurSocket} = State)
   when OurSocket =/= Socket ->
     %% Ignore tcp messages when the socket in message doesn't match
     %% our state. In order to test behavior around receiving
-    %% tcp_closed message with clients waiting in queue, we send a
+    %% ssl_closed message with clients waiting in queue, we send a
     %% fake tcp_close message. This allows us to ignore messages that
     %% arrive after that while we are reconnecting.
     {noreply, State};
@@ -180,8 +150,8 @@ handle_info({tcp_error, _Socket, _Reason}, State) ->
 %% clients. If desired, spawn of a new process which will try to reconnect and
 %% notify us when Redis is ready. In the meantime, we can respond with
 %% an error message to all our clients.
-handle_info({tcp_closed, _Socket}, State) ->
-    maybe_reconnect(tcp_closed, State);
+handle_info({ssl_closed, _Socket}, State) ->
+    maybe_reconnect(ssl_closed, State);
 
 %% Redis is ready to accept requests, the given Socket is a socket
 %% already connected and authenticated.
@@ -329,16 +299,6 @@ safe_send(Pid, Value) ->
             error_logger:info_msg("eredis: Failed to send message to ~p with reason ~p~n", [Pid, {Err, Reason}])
     end.
 
-
-ciphers() ->
-  case lists:keymember(ecdh_rsa, 1, ssl:cipher_suites()) of
-    true -> ?DEFAULT_CIPHERS;
-    false ->
-      error_logger:warning_msg("hackney_ssl: ECC not enabled"),
-      ?WITHOUT_ECC_CIPHERS
-  end.
-
-
 %% @doc: Helper for connecting to Redis, authenticating and selecting
 %% the correct database. These commands are synchronous and if Redis
 %% returns something we don't expect, we crash. Returns {ok, State} or
@@ -351,22 +311,13 @@ connect(State) ->
         _ -> State#state.port
     end,
 
-
-  BaseOpts = [binary, {active, false}, {packet, raw},
-    {secure_renegotiate, true},
-    {reuse_sessions, true},
-    {honor_cipher_order, true},
-    {versions,['tlsv1.2', 'tlsv1.1', tlsv1, sslv3]},
-    {ciphers, ciphers()}],
-  % Opts1 = merge_opts(BaseOpts, Opts),
-
     io:format("~n===================AFamily: ~p~n", [AFamily]),
     case ssl:connect(Addr, Port,
-                         [AFamily | BaseOpts], State#state.connect_timeout) of
+                         [AFamily | ?SOCKET_OPTS], State#state.connect_timeout) of
         {ok, Socket} ->
-            case authenticate(Socket, binary_to_list(State#state.password)) of
+            case authenticate(Socket, State#state.password) of
                 ok ->
-                    case select_database(Socket, binary_to_list(State#state.database)) of
+                    case select_database(Socket, State#state.database) of
                         ok ->
                             {ok, State#state{socket = Socket}};
                         {error, Reason} ->
@@ -406,7 +357,7 @@ select_database(Socket, Database) ->
 authenticate(_Socket, <<>>) ->
     ok;
 authenticate(Socket, Password) ->
-    do_sync_command(Socket, ["AUTH", " \"", Password, "\"\r\n"]).
+    do_sync_command(Socket, ["AUTH", " ", Password, "\"\r\n"]).
 
 %% @doc: Executes the given command synchronously, expects Redis to
 %% return "+OK\r\n", otherwise it will fail.
